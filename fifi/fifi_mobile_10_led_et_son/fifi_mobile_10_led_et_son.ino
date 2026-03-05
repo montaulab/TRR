@@ -1,0 +1,539 @@
+
+#include <Adafruit_NeoPixel.h> // https://github.com/adafruit/Adafruit_NeoPixel/tree/master
+#include <WiFi.h>       // pour la gestion du wifi
+#include <EEPROM.h>     // EEprom pour la sauvegarde des datas
+#include <VL53L1X.h>    // https://github.com/pololu/vl53l1x-arduino
+#include <ESP32Servo.h> // https://madhephaestus.github.io/ESP32Servo/annotated.html
+#include "DFRobotDFPlayerMini.h"
+
+DFRobotDFPlayerMini myDFPlayer;
+
+
+#define pin_effet_hall 13 // capteur effet hall sur roue arière droite
+#define pin_leds 14  // GPIO14 led WS2812B
+#define pin_servo_vitesse 15 // ECS (variateur) du moteur
+#define pin_servo_direction 2 // servomoteur de direction
+#define pin_433_MD 32 // Marche Direction télécommande 433mhz
+#define pin_433_AV 33 // Arret Vitesse télécommande 433mhz
+#define pin_433_MV 34 // Marche Vitesse télécommande 433mhz
+#define pin_433_AD 35 // Arret Direction télécommande 433mhz
+
+#define nb_leds 12   // nombre de leds, 6 leds avant, 6 leds arrière
+
+Adafruit_NeoPixel leds(nb_leds, pin_leds, NEO_GRB + NEO_KHZ800);
+
+void IRAM_ATTR ISR_tour_de_roue(); // fonction IRS en ram au lieu flash
+
+// les servomoteurs
+Servo servo_direction;
+Servo servo_vitesse;
+
+VL53L1X lidar_centre;
+VL53L1X lidar_droit;
+VL53L1X lidar_gauche;
+
+int minUs = 1000;
+int maxUs = 2000;
+
+// SSID & Password
+const char* ssid = "le_Wi_Fifi";  // Enter your SSID here
+const char* password = "123456789";  //Enter your Password here
+
+// IP Address details
+IPAddress local_ip(192, 168, 1, 1);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WiFiServer server(80);  // objet pour le serveur web
+WiFiClient client;      // prépare la récetion du client
+
+String p; // contient la page web à afficher
+
+int v_mini,v_maxi;  // vitesse ini et maxi de la voiture
+int d_centre;       // centre du servo de direction par défaut 90
+int d_droite;       // maxi doite du servo de direction par défaut 180
+int d_gauche;       // maxi gauche du servo de direction par défaut 0
+int nb_tour_a_faire = 5;    // nombre de tour à faire
+int nb_tour_fait = 0;  // // nombre de tour fait
+volatile unsigned long nb_puls = 0; // volatile pour l'intéruption
+unsigned int nb_puls_par_tour = 0; // nombre de puls roue pour un tour
+unsigned int nb_puls_pour_10m = 0; // nombre de puls roue pour faire 10m
+unsigned int nb_puls_a_faire = nb_puls_par_tour * nb_tour_a_faire + nb_puls_pour_10m;
+
+int refresh = 0;
+
+int direction = 90; // angle de direction au centre
+int vitesse = 90;   // 90 vitesse à 0, 
+
+int coef_vitesse = 20; // divise la distance du lidar centrale pour donner une vitesse
+int coef_direction = 5; // divise la diférence entre les deux lidars D/G pour donner la direction
+
+int lidar; // différence entre lidar droit et gauche en cm
+
+bool marche_dir, marche_vit; // mémoire marche arret du servo moteur et vitesse
+
+unsigned long t0,t1;
+int i_led, mi_led;
+
+int n_son = 1;
+
+/************************************************* setup *************************************************/
+void setup() {
+  Serial.begin(115200); // port série pour le débug
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+
+  EEPROM.begin(20); // réserve 10 octets dans la EEprom
+  
+  v_mini = ee_read(0);    // vitesse mini lecture eeprom adresse 0
+  v_maxi = ee_read(2);    // vitesse maxi lecture eeprom adresse 2
+  d_centre = ee_read(4);  // centre direction (90) eeprom adresse 4
+  d_droite = ee_read(6);  // droite direction (180)eeprom adresse 6 
+  d_gauche = ee_read(8);  // gauche direction (0) eeprom adresse 8
+  nb_tour_a_faire = ee_read(10); // nombre de tour à faire eeprom adresse 10
+  coef_vitesse = ee_read(12); // coéf vitesse (20) eeprom adresse 10 
+  coef_direction = ee_read(14); // coef direction (5) eeprom adresse 10 
+  nb_puls_par_tour = ee_read(16); // nombre de puls roue pour un tour
+  nb_puls_pour_10m = ee_read(18); // nombre de puls roue pour faire 10m
+  
+  nb_puls_a_faire = nb_puls_par_tour * nb_tour_a_faire + nb_puls_pour_10m; // pour une course
+
+
+  // pour ESP neuve:
+  if (v_mini>255) v_mini=0;
+  if (v_maxi>255) v_maxi=150;
+  if (d_centre>255) d_centre=90;
+  if (d_droite>255) d_droite=180;
+  if (d_gauche>255) d_gauche=0;
+
+  WiFi.softAP(ssid, password);     // cré un point acces avec les codes défini avant
+  WiFi.softAPConfig(local_ip, gateway, subnet); // configure les adresse ip du serveur
+
+
+
+  IPAddress IP = WiFi.softAPIP(); // récupère l'adresse ip du serveur
+  Serial.print("AP adresse IP : ");
+  Serial.println(IP);
+  
+  server.begin();
+  Serial.println("demarrage du serveur");
+  delay(100);
+
+  ESP32PWM::allocateTimer(0);
+	ESP32PWM::allocateTimer(1);
+	ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  servo_direction.attach(pin_servo_direction, minUs, maxUs);
+	servo_vitesse.attach(pin_servo_vitesse, minUs, maxUs);  
+
+  servo_vitesse.write(vitesse);
+  servo_direction.write(direction);
+
+  pinMode(pin_effet_hall, INPUT_PULLUP); // capteur effet Hall de la roue arrière droite
+
+  init_lidar();
+
+  // télécommande 
+  pinMode(pin_433_MD, INPUT); // A marche direction
+  pinMode(pin_433_MV, INPUT); // B marche vitesse
+  pinMode(pin_433_AD, INPUT); // C arret direction  
+  pinMode(pin_433_AV, INPUT); // D arret vitesse 
+
+  attachInterrupt(digitalPinToInterrupt(pin_effet_hall), ISR_tour_de_roue, RISING);
+
+  leds.begin();
+  leds.clear();
+
+  myDFPlayer.begin(Serial2);
+
+  myDFPlayer.volume(30);  //Set volume value. From 0 to 30
+ // myDFPlayer.play(2);
+
+  
+  Serial.println();
+  Serial.print("nb_puls_a_faire = ");
+  Serial.println(nb_puls_a_faire);
+  Serial.print("nb_puls_par_tour = ");
+  Serial.println(nb_puls_par_tour);
+  Serial.print("nb_puls_pour_10m = ");
+  Serial.println(nb_puls_pour_10m);
+
+}
+
+// intéruption pour le nombre de tour de roue (ISR)
+void IRAM_ATTR ISR_tour_de_roue() {
+  nb_puls ++;
+
+}
+
+
+/************************************************* loop *************************************************/
+void loop() {
+  
+  
+  t0 = millis();
+
+  /*
+  Serial.print(t0);
+  Serial.println();
+  t0 = millis();
+  */
+
+  client = server.available();  // regarde si il y à une connections
+  if ( client ) wifi();         // si un nouveau client,
+  
+  int distance_droit = lidar_droit.read();
+  int distance_gauche = lidar_gauche.read();
+  int distance_centre = lidar_centre.read();
+
+  ////////////////////////////  vitesse  ////////////////////////////////////////
+  vitesse = v_mini + distance_centre / coef_vitesse;
+
+  if (vitesse > v_maxi) vitesse = v_maxi;
+
+  //Serial.println(vitesse);
+
+  if (marche_vit) {
+    servo_vitesse.write(vitesse);
+  }else servo_vitesse.write(90);
+
+
+ //////////////////////////////// direction  ////////////////////////////////////
+ 
+  direction = ( distance_droit - distance_gauche )/coef_direction + d_centre;
+
+  if (direction >d_droite) direction = d_droite;
+  else if(direction < d_gauche) direction = d_gauche;
+
+  if (marche_dir){
+    servo_direction.write(direction);
+  }
+
+ // Serial.println(direction);
+
+  if (digitalRead(pin_433_MD)) marche_dir = true; // A
+  else if (digitalRead(pin_433_MV)) marche_vit = true; // B
+  else if (digitalRead(pin_433_AD)) marche_dir = false;// C  
+  else if (digitalRead(pin_433_AV)) marche_vit = false;// D  
+  else if (nb_puls > nb_puls_a_faire) marche_vit = false;
+
+  if (t0>t1){
+    t1 = t0 + 10;
+    leds.clear();
+    
+    leds.setPixelColor(random(nb_leds), random(0xffffff) );
+    leds.show();//leds.Color(255, 0, 0)
+    
+  }
+
+}
+
+//*************************************** init_lidar ******************************************
+void init_lidar(){
+    pinMode(18,OUTPUT);
+    digitalWrite(18,0);
+    pinMode(19,OUTPUT);
+    digitalWrite(19,0);
+    delay(100);
+    
+    Wire.begin(21, 22);
+    delay(100);
+
+    lidar_centre.setTimeout(500);
+    if (!lidar_centre.init()) {
+        Serial.println("defaut lidar_centre");
+        while (1);
+    }
+    lidar_centre.setAddress(0x2B);
+    lidar_centre.startContinuous(50);
+
+    delay(100);
+    digitalWrite(18,1);
+    delay(100);
+
+    lidar_droit.setTimeout(500);
+    if (!lidar_droit.init()) {
+        Serial.println("Defaut lidar_droit");
+        while (1);
+    }
+    lidar_droit.setAddress(0x2C);
+    lidar_droit.startContinuous(50);
+    
+    delay(100);
+    digitalWrite(19,1);
+    delay(100);
+
+    lidar_gauche.setTimeout(500);
+    if (!lidar_gauche.init()) {
+        Serial.println("Defaut lidar_gauche");
+        while (1);
+    }
+    lidar_gauche.startContinuous(50);
+
+}
+
+/************************************************* wifi *************************************************/
+void wifi(){
+  
+    refresh = 1;
+    String request = client.readStringUntil('\r'); // récupère la requette
+    client.flush(); // efface le tampon pour les prochaines requettes
+   
+    if (request.indexOf("?c_vit") != -1 ) { // requette c_vit coef_direction
+      coef_vitesse = val(request);
+      ee_write(coef_vitesse , 12); // enregistre v_maxi dans la EEprom à l'adresse 2
+      p_0(); // affiche la page web 0
+    }    
+    else if (request.indexOf("?c_dir") != -1 ) { // si la requette est c_dir (coef_direction)
+      coef_direction = val(request);
+      ee_write(coef_direction , 14); // enregistre v_mini dans la EEprom à l'adresse 0
+      p_0(); // affiche la page web 0
+    }
+    else if (request.indexOf("?v_mini") != -1 ) { // si la requette est v_mini
+      v_mini = val(request);
+      ee_write(v_mini , 0); // enregistre v_mini dans la EEprom à l'adresse 0
+      p_0(); // affiche la page web 0
+    }
+    else if (request.indexOf("?v_maxi") != -1 ) { // si la requette est /led
+      v_maxi = val(request);
+      ee_write(v_maxi , 2); // enregistre v_maxi dans la EEprom à l'adresse 2
+      p_0(); // affiche la page web 0
+    }
+    else if (request.indexOf("?d_centre") != -1 ) { // si la requette est /led
+      d_centre = val(request);
+      ee_write(d_centre , 4); // enregistre d_centre dans la EEprom à l'adresse 4
+      p_0(); // affiche la page web 0
+    }    
+    else if (request.indexOf("?d_droite") != -1 ) { // si la requette est /led
+      d_droite = val(request);
+      ee_write(d_droite , 6); // enregistre d_droite dans la EEprom à l'adresse 6
+      p_0(); // affiche la page web 0
+    }     
+    else if (request.indexOf("?d_gauche") != -1 ) { // si la requette est /led
+      d_gauche = val(request);
+      ee_write(d_gauche , 8); // enregistre d_gauche dans la EEprom à l'adresse 8
+      p_0(); // affiche la page web 0
+    }         
+    else if (request.indexOf("?ntour") != -1 ) { // si la requette nb_tour_a_faire
+      nb_tour_a_faire = val(request);
+      nb_puls_a_faire = nb_puls_par_tour * nb_tour_a_faire + nb_puls_pour_10m;
+      ee_write(nb_tour_a_faire , 10); // enregistre nb_tour_fait dans la EEprom à l'adresse 10
+      p_0(); // affiche la page web 0
+    }      
+    else if (request.indexOf("?nb_tour_fait") != -1 ) { // si la requette est nombre de tour de circuit fait
+      nb_tour_fait = val(request);
+      p_0(); // affiche la page web 0
+    }    
+    else if (request.indexOf("?nb_puls") != -1 ) { // si la requette est nombre de tour de roue
+      nb_puls = val(request);
+      p_0(); // affiche la page web 0
+    }  
+    else if (request.indexOf("?nb_tr") != -1 ) { // si la requette est nombre de puls roue pour un tour
+      nb_puls_par_tour = val(request);
+      nb_puls_a_faire = nb_puls_par_tour * nb_tour_a_faire + nb_puls_pour_10m;
+      ee_write(nb_puls_par_tour , 16); // enregistre nombre de tour de roue dans la EEprom à l'adresse 16
+      p_0(); // affiche la page web 0
+    }    
+    else if (request.indexOf("?nb_r10m") != -1 ) { // si la requette est nombre de puls roue pour faire 10m
+      nb_puls_pour_10m = val(request);
+      nb_puls_a_faire = nb_puls_par_tour * nb_tour_a_faire + nb_puls_pour_10m;
+      ee_write(nb_puls_pour_10m , 18); // enregistre nb_tour_fait dans la EEprom à l'adresse 10
+      p_0(); // affiche la page web 0
+    }
+    else if (request.indexOf("?n_son") != -1 ) { // si la requette est nombre de puls roue pour faire 10m
+      n_son = val(request);
+      myDFPlayer.play(n_son);
+      p_0(); // affiche la page web 0
+    }
+    
+    else {
+      refresh = 0;
+      p_0();
+     }// affiche la page web 0
+
+  client.println();
+  client.stop();
+}
+
+int val(String requette){
+  int a = requette.indexOf("=") ;
+  requette.remove(0, a + 1);
+  a = requette.indexOf(" ") ;
+  requette.remove(a);
+  return requette.toInt(); // récupère la valeur numérique
+}
+
+/************************************************* ee_write *************************************************/
+void ee_write(int data, int adresse){ // écrit la EEprom
+  EEPROM.write( adresse , data / 256 );  // écrit la valeur dans la EEprom octet 0
+  EEPROM.write( adresse + 1 , data - ( data * 256 ) );  // écrit la valeur dans la EEprom octet 1   
+  EEPROM.commit();
+}  
+
+/************************************************* ee_read *************************************************/
+int ee_read(int adresse){ // lit la EEprom et retourn le résultat
+ return 256 * EEPROM.read( adresse ) + EEPROM.read( adresse + 1 );
+}
+
+/************************************************* p_0 *************************************************/
+void p_0(){
+  delay(1);
+  client.println( page_0() );
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////// gestion des pages html //////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/*################################################## page_0 ###################################################*/
+String page_0(){ // page HTML
+
+  String t; // permetra de stocker du texte
+
+  entete("Montaulab TRR 2026<br>" , refresh ); // cré une nouvelle page qui se rafraichi toute les 5s 
+
+  titre( "Données de la meilleure voiture", "h2" , "#33aa55", "#FFFFFF");
+
+  br(); br();
+  
+  input("jouer son :\n" , n_son, "n_son"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("coef direction par defaut (5)\n" , coef_direction, "c_dir"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("coef vitesse par defaut (20)\n" , coef_vitesse, "c_vit"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("vitesse mini ( de 0 à 180 )\n" , v_mini, "v_mini"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("vitesse maxi ( de 0 à 180 )\n" , v_maxi, "v_maxi"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("angle de direction au centre (défaut 90)\n" , d_centre, "d_centre"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();
+
+  input("angle de direction maxi à droite (défaut 180)\n" , d_droite, "d_droite"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();  
+
+  input("angle de direction maxi à gauche (défaut 0)\n" ,d_gauche, "d_gauche"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();  
+
+  input("Nb tour de circuit à faire\n" , nb_tour_a_faire, "ntour"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();  
+
+  input("Nb tour de circuit fait\n" , nb_tour_fait, "nb_tour_fait"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();   
+
+  input("Nb puls roue\n" , nb_puls, "nb_puls"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br(); 
+
+  input("Nb puls roue pour faire un tour de circuit\n" , nb_puls_par_tour, "nb_tr"); // input(texte, valeur à modifier, nom de la requette)
+
+  br(); br();   
+
+  input("Nb puls roue pour faire 10m\n" , nb_puls_pour_10m , "nb_r10m"); // input(texte, valeur à modifier, nom de la requette)
+  
+  br(); br(); 
+  
+  bouton(" refresh " , "","dddddd","18" );
+ 
+  fin_page();  // fin de page HTML
+  return p;
+} // fin page_0()
+
+
+/*################################################## page_v_mini ###################################################*/
+String page_v_mini(){ // vitesse mini
+
+  entete("Montaulab TRR 2026<br>" , 0 );
+  titre("vitesse mini 90 à 180" , "h2" , "#33aa55", "#FFFFFF" );
+  //p += "de 90 à 180, valeur en cours : " + String(v_mini) + "  : ";
+  p += "<form>vitesse mini  <input type=\"number\" name=\"v_mini\" id=\"coucou\"  value=\"" + String(v_mini) + "\" /><br>";
+  p += "<input type=\"submit\" value=\"  valider  \"> </form> <br>";
+
+  bouton(" Retour ","","dddddd","24"); 
+  
+  fin_page(); 
+  return p;
+}
+
+/*################################################## page_v_maxi ###################################################*/
+String page_v_maxi(){ // vitesse mini
+  entete("Montaulab TRR 2026<br>" , 0 );
+  titre("vitesse maxi 90 à 180" , "h2" , "#33aa55", "#FFFFFF" );
+  p += "de 90 à 180, valeur en cours : " + String(v_maxi) + "<br>";
+  p += "<form> <input type=\"number\" name=\"v_maxi\" id=\"coucou\" minlength=\"90\" maxlength=\"180\" size=\"20\" /><br>";
+  p += "<input type=\"submit\" value=\"  valider  \"> </form> <br>";
+
+  bouton(" Retour ","","dddddd","24"); 
+  
+  fin_page(); 
+  return p;
+}
+
+// fonction pour gérer le HTML plus facilement
+/*##################################################  entête  ###################################################*/
+void entete(String texte, int temps){// header texte=titre de la fenetre, r = au temps en seconde avant de rafraichir la fenetre
+   // entête des pages html 
+  p = "<!doctype html>\n";
+  p += "<head>\n";
+  p += "<meta charset=\"utf-8\">\n";
+  p += "<title>Solaire - fifi82 2025</title>\n";
+  if(temps) p += "<meta http-equiv=\"refresh\" content=\"" + String(temps) + ";/\">\n"; // permet de recharger la page toute les r secondes
+  p += "<link rel=\"stylesheet\" href=\"style.css\">\n";
+  p += "<script src=\"script.js\"></script>\n";
+  p += "</head>\n";
+  p += "<body><center>";
+  p += "<h1><p style=\"background-color: #000000; color: white;\">" + texte + "<br>";
+  p += "</h1>";
+}
+
+/*################################################## bouton ###################################################*/
+void bouton(String texte, String requette, String couleur, String fonte){// \" affiche un " en HTML
+  p +=  "<input type=\"button\" onclick=\"window.location.href = '/" + requette + "';\" value=\"\n  " + texte;
+  p +=  "  \n \"style=\"background-color: #" + couleur + "; color: #F000000; font-size:"+fonte+"px\" /><br>"; 
+}
+
+/*################################################## fin page ###################################################*/
+void fin_page(){
+  p+= "<p style=\"background-color: #ffffff;color: white;\">. . . . . . . . . . . . . . . . . . . . . .</p></h2></center></body> </html>"; 
+}
+
+/*################################################## texte ###################################################*/
+void texte(String texte, String h){
+  p +="<" + h + ">" + texte + "</" + h + ">" +"<br>";
+}
+
+/*################################################## titre ###################################################*/
+void titre2(String texte, String cf, String ct){ // h=taille du texte, cf=couleur du fond, ct=couleur du texte
+  p += "<p style=\"background-color:"+ cf +"; color: "+ ct +";\">"+texte+"</p>";
+}
+
+/*################################################## titre ###################################################*/
+void titre(String texte, String h, String cf, String ct){ // h=taille du texte, cf=couleur du fond, ct=couleur du texte
+  p += "<" + h + "><p style=\"background-color:"+ cf +"; color: "+ ct +";\">"+texte+"</p></" + h + ">";
+}
+
+/*################################################## br ###################################################*/
+void br(){ // retour à la ligne
+  p += "<br>";
+}
+
+/*################################################## input ###################################################*/
+void input(String texte, int val, String name){ // 
+  p += "<form>" + texte +"<input type=\"number\" name=\"" + name + "\" value=\"" + String(val) + "\" /> </form>";
+}
