@@ -4,7 +4,7 @@
 
 <hr/>
 
-### les composents :
+### les composants :
 - 1 ESP32 wroom32
 - 3 lidar
 - 1 régulateur 7805
