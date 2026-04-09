@@ -10,7 +10,7 @@
 - 1 régulateur 7805
 
 <hr/>
-###  le cablage :
+### le cablage :
 <img alt="image" src="https://github.com/montaulab/TRR/blob/main/fifi/schema_bb.png" />
 
 
